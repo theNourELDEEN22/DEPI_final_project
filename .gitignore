@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 .env
-sales_transactions_*.csv
+sales_transactions_*.csv.venv/
+__pycache__/
+.pytest_cache/
