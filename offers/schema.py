@@ -15,7 +15,17 @@ from enum import Enum
 from typing import Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _canonical(value):
+    """One spelling per value, so the hash does not change when the same offer comes
+    back from a database or another service written differently."""
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f")  # 20, 20.0 and 20.00 all become "20"
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()  # same instant, same text
+    raise TypeError(f"cannot hash a value of type {type(value).__name__}")
 
 
 class OfferType(str, Enum):
@@ -68,6 +78,15 @@ class Offer(BaseModel):
     bundle_items: Optional[list[BundleItem]] = None
     bundle_price: Optional[Decimal] = Field(default=None, gt=0)
 
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def _dates_must_have_a_timezone(cls, value: datetime) -> datetime:
+        # A date without a timezone cannot be compared with "now" (it raises later),
+        # so it is refused when the offer is created.
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise ValueError("dates must include a timezone (use UTC)")
+        return value
+
     @model_validator(mode="after")
     def _check_type_fields(self) -> "Offer":
         used = {
@@ -108,9 +127,7 @@ class Offer(BaseModel):
     def content_hash(self) -> str:
         """Hash of the commercial content. Used by the approval service so an
         approval of version N never matches version N+1 (D8)."""
-        payload = self.model_dump(
-            mode="json", exclude={"status", "approval_hash", "created_at"}
-        )
+        payload = self.model_dump(exclude={"status", "approval_hash", "created_at"})
         return hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode()
+            json.dumps(payload, sort_keys=True, default=_canonical).encode()
         ).hexdigest()
