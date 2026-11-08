@@ -1,24 +1,21 @@
 """D10 - POS activation with idempotency key and response check (Epic D: Offers).
 
-Flow: final recheck (D9) -> send to the POS with an idempotency key -> check the answer.
+Flow for an APPROVED offer:
+  1. Final recheck (D9). Any failure blocks activation and the POS is never called.
+  2. Build a deterministic idempotency key for (offer, version, approval).
+  3. Send the activation to the POS.
+       - confirmed  -> offer becomes ACTIVE
+       - rejected   -> offer stays APPROVED, reason recorded
+       - UNCLEAR (timeout, error, garbage response) -> do NOT guess and do NOT blindly
+         send again: ask the POS for the status of that key FIRST.
+            * POS says active      -> ACTIVE
+            * POS never saw it     -> send once more with the SAME key
+            * still unclear        -> UNCONFIRMED, a person has to check
+The idempotency key lets the POS ignore a repeated request, so a retry can never
+create the offer twice. Only the POS can say an offer is live; we never assume it.
 
-Rule from the task table: an unclear response triggers a status check FIRST.
-Never guess and never blindly send again, because the POS may have activated the
-offer even though the answer was lost.
-
-  confirmed  : 2xx and a body that says this offer is active  -> ACTIVE
-  rejected   : 4xx with an explicit rejection in the body      -> stop, no retry
-  unclear    : anything else (timeout, 5xx, empty or odd body, wrong offer id)
-               -> ask the POS for the status of this activation
-                    active      -> ACTIVE (confirmed by the status check)
-                    not active  -> safe to retry with the SAME idempotency key
-                    unknown     -> stop: UNCONFIRMED, a person must check
-
-The idempotency key is built from offer id, version and approval hash, so a repeat
-of the same activation can never create a second one, and a new version always
-gets a new key.
-
-M5 builds the mock POS (E3). It only has to match the small PosClient interface here.
+The real POS (the mock POS from M5, task E3) plugs in through the PosClient
+interface; only a small adapter is needed to map its replies to PosResponse.
 """
 from __future__ import annotations
 
@@ -28,53 +25,62 @@ from enum import Enum
 from typing import Any, Optional, Protocol
 
 from offers.decisions import DecisionStore
-from offers.final_check import final_recheck
-from offers.guardrails import ActiveOffers, GuardrailConfig, PriceReader, ProductRules
+from offers.guardrails import (
+    ActiveOffers,
+    GuardrailConfig,
+    PriceReader,
+    ProductRules,
+)
+from offers.recheck import final_recheck
 from offers.review import _jsonable, _terms
 from offers.schema import Offer, OfferStatus
 from offers.validation import CatalogReader, ValidationConfig
 
 
+class PosOutcome(str, Enum):
+    ACTIVE = "active"        # the POS confirms the offer is live
+    REJECTED = "rejected"    # the POS refused it
+    NOT_FOUND = "not_found"  # status check: the POS never received this key
+    UNCLEAR = "unclear"      # timeout, error, or a reply we cannot read
+
+
 @dataclass(frozen=True)
 class PosResponse:
-    http_status: Optional[int]
-    body: Optional[dict[str, Any]] = None
+    outcome: PosOutcome
+    pos_ref: Optional[str] = None   # the POS's own id for the live offer
+    detail: Optional[str] = None
 
 
 class PosClient(Protocol):
-    def activate_offer(self, payload: dict[str, Any], idempotency_key: str) -> PosResponse: ...
-    def get_activation_status(self, idempotency_key: str) -> PosResponse: ...
+    def activate(self, idempotency_key: str, payload: dict) -> PosResponse: ...
+    def get_status(self, idempotency_key: str) -> PosResponse: ...
 
 
-@dataclass(frozen=True)
-class ActivationConfig:
-    max_retries: int = 1  # extra attempts after the first, only after a status check
-
-
-class Outcome(str, Enum):
+class ActivationOutcome(str, Enum):
     ACTIVATED = "activated"
-    BLOCKED = "blocked"                # the final recheck failed, the POS was never called
+    BLOCKED = "blocked"                  # final recheck failed, POS never called
     REJECTED_BY_POS = "rejected_by_pos"
-    FAILED = "failed"                  # status check says not active after all attempts
-    UNCONFIRMED = "unconfirmed"        # status unknown: a person must check the POS
+    UNCONFIRMED = "unconfirmed"          # unclear even after the status check
 
 
 @dataclass(frozen=True)
 class ActivationResult:
-    outcome: Outcome
+    outcome: ActivationOutcome
     offer: Offer
-    reasons: tuple[str, ...]
-    idempotency_key: Optional[str]
-    activate_calls: int
-    status_checked: bool
-    confirmed_via: Optional[str] = None  # "response" or "status_check"
+    reasons: tuple[str, ...] = ()
+    idempotency_key: Optional[str] = None
+    pos_ref: Optional[str] = None
 
 
-def idempotency_key(offer: Offer) -> str:
-    return f"offer-{offer.offer_id}-v{offer.version}-{(offer.approval_hash or '')[:16]}"
+def idempotency_key_for(offer: Offer) -> str:
+    """Same offer + same version + same approval -> same key, on every retry."""
+    if not offer.approval_hash:
+        raise ValueError("an offer needs an approval hash before it can be activated")
+    return f"offer:{offer.offer_id}:v{offer.version}:{offer.approval_hash[:16]}"
 
 
-def build_pos_payload(offer: Offer) -> dict[str, Any]:
+def pos_payload(offer: Offer) -> dict[str, Any]:
+    """What the POS receives: the approved commercial terms, nothing else."""
     return _jsonable(
         {
             "offer_id": offer.offer_id,
@@ -91,107 +97,104 @@ def build_pos_payload(offer: Offer) -> dict[str, Any]:
     )
 
 
-def _classify_activation(resp: PosResponse, offer: Offer) -> tuple[str, str]:
-    """Return ("confirmed" | "rejected" | "unclear", detail)."""
-    body = resp.body if isinstance(resp.body, dict) else None
-    if resp.http_status in (200, 201) and body is not None:
-        if body.get("status") == "active" and body.get("offer_id") == offer.offer_id:
-            return "confirmed", "POS confirmed activation"
-        return "unclear", "POS answered 2xx but did not confirm this offer"
-    if (
-        resp.http_status is not None
-        and 400 <= resp.http_status < 500
-        and resp.http_status not in (408, 429)
-        and body is not None
-        and body.get("status") in ("rejected", "error")
-    ):
-        return "rejected", f"POS rejected the offer: {body.get('reason', 'no reason given')}"
-    return "unclear", f"unclear POS response (http {resp.http_status})"
+def _safe(call, *args) -> PosResponse:
+    """Any failure or unreadable reply counts as UNCLEAR, never as success."""
+    try:
+        response = call(*args)
+    except Exception as exc:  # timeouts, connection errors, adapter errors
+        return PosResponse(PosOutcome.UNCLEAR, detail=f"{type(exc).__name__}: {exc}")
+    if not isinstance(response, PosResponse):
+        return PosResponse(PosOutcome.UNCLEAR, detail="unreadable POS response")
+    return response
 
 
-def _classify_status(resp: PosResponse, offer: Offer) -> str:
-    """Return "active" | "not_active" | "unknown"."""
-    body = resp.body if isinstance(resp.body, dict) else None
-    if resp.http_status == 404:
-        return "not_active"
-    if resp.http_status == 200 and body is not None:
-        state = body.get("state")
-        if state == "active" and body.get("offer_id") == offer.offer_id:
-            return "active"
-        if state in ("not_found", "inactive"):
-            return "not_active"
-    return "unknown"
-
-
-def activate_offer(
+def activate_on_pos(
     offer: Offer,
     *,
     pos: PosClient,
-    decision_store: DecisionStore,
+    store: DecisionStore,
     catalog: CatalogReader,
     prices: PriceReader,
     rules: ProductRules,
     active: ActiveOffers,
     validation_config: ValidationConfig,
     guardrail_config: GuardrailConfig,
-    activation_config: ActivationConfig = ActivationConfig(),
+    log,
     now: datetime | None = None,
 ) -> ActivationResult:
     now = now or datetime.now(timezone.utc)
 
-    recheck = final_recheck(
+    if offer.status == OfferStatus.ACTIVE:  # already live: nothing to send
+        return ActivationResult(ActivationOutcome.ACTIVATED, offer)
+
+    check = final_recheck(
         offer,
-        decision_store=decision_store,
+        store=store,
         catalog=catalog,
         prices=prices,
         rules=rules,
         active=active,
         validation_config=validation_config,
         guardrail_config=guardrail_config,
+        log=log,
         now=now,
     )
-    if not recheck.ok:
-        return ActivationResult(Outcome.BLOCKED, offer, recheck.reasons, None, 0, False)
+    if not check.ok:
+        return ActivationResult(ActivationOutcome.BLOCKED, offer, reasons=check.reasons)
 
-    key = idempotency_key(offer)
-    payload = build_pos_payload(offer)
-    calls = 0
-    status_checked = False
-    last_detail = ""
+    key = idempotency_key_for(offer)
+    payload = pos_payload(offer)
 
-    def done(outcome: Outcome, reasons: tuple[str, ...], via: str | None = None) -> ActivationResult:
-        new_offer = offer.model_copy(update={"status": OfferStatus.ACTIVE}) if outcome == Outcome.ACTIVATED else offer
-        return ActivationResult(outcome, new_offer, reasons, key, calls, status_checked, via)
+    def finish(outcome: ActivationOutcome, reasons=(), pos_ref=None) -> ActivationResult:
+        new_offer = (
+            offer.model_copy(update={"status": OfferStatus.ACTIVE})
+            if outcome == ActivationOutcome.ACTIVATED
+            else offer
+        )
+        log.entries.append(
+            {
+                "offer_id": offer.offer_id,
+                "version": offer.version,
+                "stage": "activation",
+                "outcome": outcome.value,
+                "idempotency_key": key,
+                "reasons": list(reasons),
+                "at": now,
+            }
+        )
+        return ActivationResult(outcome, new_offer, tuple(reasons), key, pos_ref)
 
-    for _attempt in range(1 + activation_config.max_retries):
-        calls += 1
-        try:
-            verdict, last_detail = _classify_activation(pos.activate_offer(payload, key), offer)
-        except Exception as exc:  # timeouts, connection errors: the answer is lost
-            verdict, last_detail = "unclear", f"no usable answer from the POS ({type(exc).__name__})"
-
-        if verdict == "confirmed":
-            return done(Outcome.ACTIVATED, (), "response")
-        if verdict == "rejected":
-            return done(Outcome.REJECTED_BY_POS, (last_detail,))
-
-        # Unclear answer: status check FIRST, before anything else.
-        status_checked = True
-        try:
-            state = _classify_status(pos.get_activation_status(key), offer)
-        except Exception:
-            state = "unknown"
-
-        if state == "active":
-            return done(Outcome.ACTIVATED, (), "status_check")
-        if state == "unknown":
-            return done(
-                Outcome.UNCONFIRMED,
-                (last_detail, "status check was also unclear: check the POS manually"),
+    def from_response(resp: PosResponse) -> Optional[ActivationResult]:
+        if resp.outcome == PosOutcome.ACTIVE:
+            return finish(ActivationOutcome.ACTIVATED, pos_ref=resp.pos_ref)
+        if resp.outcome == PosOutcome.REJECTED:
+            return finish(
+                ActivationOutcome.REJECTED_BY_POS,
+                reasons=[resp.detail or "rejected by the POS"],
             )
-        # not_active: the POS did not activate it, so a retry with the same key is safe
+        return None  # NOT_FOUND / UNCLEAR: caller decides
 
-    return done(
-        Outcome.FAILED,
-        (last_detail, f"status check says not active after {calls} attempt(s)"),
+    first = from_response(_safe(pos.activate, key, payload))
+    if first is not None:
+        return first
+
+    # Unclear reply: ask the POS what it has for this key BEFORE doing anything else.
+    status = _safe(pos.get_status, key)
+    decided = from_response(status)
+    if decided is not None:
+        return decided
+
+    if status.outcome == PosOutcome.NOT_FOUND:
+        # The POS never received it. Safe to send again with the same key, once.
+        second = from_response(_safe(pos.activate, key, payload))
+        if second is not None:
+            return second
+        return finish(
+            ActivationOutcome.UNCONFIRMED,
+            reasons=["POS reply unclear after retry, check the POS manually"],
+        )
+
+    return finish(
+        ActivationOutcome.UNCONFIRMED,
+        reasons=["POS reply unclear and status check unclear, check the POS manually"],
     )

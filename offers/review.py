@@ -14,7 +14,6 @@ Anything else raises ReviewNotAllowed with the reasons (fail closed).
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
