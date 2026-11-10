@@ -60,7 +60,7 @@ class TestStagingDeployA15(unittest.TestCase):
         self.assertIn("postgres-staging:", DOCKER_COMPOSE_STAGING_CONTENT)
         self.assertIn("retail-agents-staging:", DOCKER_COMPOSE_STAGING_CONTENT)
         self.assertIn("001_shared_foundation_schema.sql", DOCKER_COMPOSE_STAGING_CONTENT)
-        self.assertIn("python -m unittest discover -s tests", GITHUB_CI_WORKFLOW_CONTENT)
+        self.assertIn("python -m unittest discover -s foundation/tests", GITHUB_CI_WORKFLOW_CONTENT)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             deployer = StagingDeployer()
