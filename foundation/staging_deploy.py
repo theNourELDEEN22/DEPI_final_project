@@ -114,7 +114,7 @@ jobs:
           python-version: "3.12"
 
       - name: Run full unit and integration test suite
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        run: python -m unittest discover -s foundation/tests -p "test_*.py" -v
 
       - name: Run one-command staging deployment & smoke check
         run: python -m foundation.staging_deploy --verify-only
