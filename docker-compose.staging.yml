@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  postgres-staging:
+    image: postgres:15-alpine
+    container_name: depi-retail-postgres-staging
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: staging_password
+      POSTGRES_DB: retail_staging
+      TZ: Africa/Cairo
+    ports:
+      - "54322:5432"
+    volumes:
+      - ./foundation/db/001_shared_foundation_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d retail_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  retail-agents-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: depi-retail-agents-staging
+    depends_on:
+      postgres-staging:
+        condition: service_healthy
+    environment:
+      APP_ENV: staging
+      TZ: Africa/Cairo
+    command: ["python", "-m", "foundation.staging_deploy", "--verify-only"]
