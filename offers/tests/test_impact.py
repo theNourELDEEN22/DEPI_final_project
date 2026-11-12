@@ -1,3 +1,6 @@
+from reporting.kpi_reader import KpiReaderAdapter
+from reporting.mock_repository import MockReportingRepository
+
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -227,3 +230,96 @@ def test_report_is_json_serializable():
     json.dumps(d)
     assert d["roi"] == "0.25"
     assert d["incremental"]["net_revenue"] == "2000.00"
+
+
+
+def test_real_reporting_kpi_adapter_integrates_with_offers_impact():
+    repo = MockReportingRepository()
+
+    repo.sales_data = [
+        {
+            "branch_id": 1,
+            "product_id": 10,
+            "date": START.date(),
+            "time": START.time(),
+            "quantity": 10,
+            "unit_price": Decimal("100"),
+            "total_amount": Decimal("900"),
+            "discount_amount": Decimal("100"),
+            "transaction_id": 101,
+        }
+    ]
+
+    repo.returns_data = [
+        {
+            "branch_id": 1,
+            "product_id": 10,
+            "returned_at": START + timedelta(hours=1),
+            "refund_amount": Decimal("100"),
+        }
+    ]
+
+    repo.products_data = [
+        {
+            "branch_id": 1,
+            "product_id": 10,
+            "cost_price": Decimal("40"),
+        }
+    ]
+
+    real_kpi = KpiReaderAdapter(repo)
+
+    offer = make_offer(
+        branch_id="1",
+        product_ids=["10"],
+        status=OfferStatus.ENDED,
+    )
+
+    baseline = FakeBaseline(
+        metrics=Metrics(
+            5,
+            Decimal("400"),
+            Decimal("200"),
+        )
+    )
+
+    result = calculate_impact(
+        offer,
+        stats=stats(redemptions=10, returns=1),
+        kpi=real_kpi,
+        baseline=baseline,
+        prices=InMemoryPrices({
+            ("1", "10"): PriceInfo(
+                price=Decimal("100"),
+                cost=Decimal("40"),
+            )
+        }),
+        now=END,
+    )
+
+    # Actual KPIs from Reporting:
+    # Units = 10
+    # Net revenue = 900 - 100 = 800
+    # COGS = 10 * 40 = 400
+    # Gross profit = 800 - 400 = 400
+
+    assert result.actual == Metrics(
+        10,
+        Decimal("800.00"),
+        Decimal("400.00"),
+    )
+
+    assert result.baseline == Metrics(
+        5,
+        Decimal("400.00"),
+        Decimal("200.00"),
+    )
+
+    assert result.incremental == Metrics(
+        5,
+        Decimal("400.00"),
+        Decimal("200.00"),
+    )
+
+    assert result.discount_cost == Decimal("200.00")
+    assert result.roi == Decimal("1.00")
