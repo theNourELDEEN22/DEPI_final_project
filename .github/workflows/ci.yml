@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Africa/Cairo
+      PYTHONPATH: .
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,8 +21,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest tzdata requests
+
       - name: Run full unit and integration test suite
-        run: python -m unittest discover -s foundation/tests -p "test_*.py" -v
+        run: python -m pytest -v
 
       - name: Run one-command staging deployment & smoke check
         run: python -m foundation.staging_deploy --verify-only
