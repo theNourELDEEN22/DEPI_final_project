@@ -1,6 +1,11 @@
+
 __pycache__/
-*.pyc
-.env
-sales_transactions_*.csv.venv/
-__pycache__/
+*.py[cod]
 .pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+sales_transactions_*.csv
