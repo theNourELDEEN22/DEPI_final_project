@@ -9,3 +9,5 @@ venv/
 !.env.example
 
 sales_transactions_*.csv
+.telegram_chat_id
+generated_reports/
